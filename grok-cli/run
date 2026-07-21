@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Cross-platform launcher for add.py.
+
+  python run auto
+  python run auto --workers 2
+  python run manual 3
+  python run --os linux auto
+  python run --os mac status
+  python run --os win auto --show
+
+--os auto|linux|mac|win  (default: auto-detect)
+"""
+from __future__ import annotations
+
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def detect_os() -> str:
+    s = platform.system().lower()
+    if s == "darwin":
+        return "mac"
+    if s == "windows":
+        return "win"
+    return "linux"
+
+
+def resolve_os(flag: str) -> str:
+    flag = (flag or "auto").lower()
+    if flag in ("auto", ""):
+        return detect_os()
+    if flag in ("linux", "mac", "win"):
+        return flag
+    print(f"unknown --os {flag!r} (use auto|linux|mac|win)", file=sys.stderr)
+    sys.exit(2)
+
+
+def find_python(os_name: str) -> Path:
+    if os_name == "win":
+        candidates = [
+            ROOT / ".venv" / "Scripts" / "python.exe",
+            ROOT / ".venv" / "Scripts" / "python",
+        ]
+    else:
+        candidates = [
+            ROOT / ".venv" / "bin" / "python",
+            ROOT / ".venv" / "bin" / "python3",
+        ]
+    for p in candidates:
+        if p.exists():
+            return p
+    # fallback: current interpreter
+    return Path(sys.executable)
+
+
+def chrome_hint(os_name: str) -> None:
+    if os.environ.get("CHROME_BIN"):
+        return
+    if os_name == "mac":
+        p = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        if p.exists():
+            os.environ["CHROME_BIN"] = str(p)
+    elif os_name == "win":
+        for base in (
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ):
+            if not base:
+                continue
+            p = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+            if p.exists():
+                os.environ["CHROME_BIN"] = str(p)
+                break
+
+
+def build_env(os_name: str) -> dict:
+    env = os.environ.copy()
+    if os_name == "linux":
+        env["GDK_BACKEND"] = "x11"
+        env["QT_QPA_PLATFORM"] = "xcb"
+        env["OZONE_PLATFORM"] = "x11"
+        env.pop("WAYLAND_DISPLAY", None)
+        env.pop("WAYLAND_SOCKET", None)
+        env.pop("ELECTRON_OZONE_PLATFORM_HINT", None)
+    return env
+
+
+def main() -> None:
+    raw = sys.argv[1:]
+    os_flag = "auto"
+    rest: list[str] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] == "--os" and i + 1 < len(raw):
+            os_flag = raw[i + 1]
+            i += 2
+            continue
+        if raw[i].startswith("--os="):
+            os_flag = raw[i].split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(raw[i])
+        i += 1
+
+    if not rest or rest[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\nCommands: pass-through to add.py (split|status|auto|manual|...)")
+        sys.exit(0 if rest and rest[0] in ("-h", "--help") else 0)
+
+    os_name = resolve_os(os_flag)
+    chrome_hint(os_name)
+    py = find_python(os_name)
+    add = ROOT / "add.py"
+    if not add.exists():
+        print(f"missing {add}", file=sys.stderr)
+        sys.exit(1)
+
+    env = build_env(os_name)
+    cmd = [str(py), "-u", str(add), *rest]
+
+    # Linux: prefer xvfb when available (hide Chrome from real display)
+    if os_name == "linux" and shutil.which("xvfb-run"):
+        cmd = [
+            "xvfb-run", "-a", "-s", "-screen 0 1280x900x24",
+            "env", "-u", "WAYLAND_DISPLAY", "-u", "WAYLAND_SOCKET",
+            *cmd,
+        ]
+
+    raise SystemExit(subprocess.call(cmd, cwd=str(ROOT), env=env))
+
+
+if __name__ == "__main__":
+    main()

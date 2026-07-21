@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.log
+sso-added.txt
+sso-pending.txt
+sso.txt
+account.txt
+accounts.json
+accounts.jsonl
+*.jsonl

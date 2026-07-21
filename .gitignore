@@ -1,0 +1,13 @@
+**/.venv/
+**/.env
+**/sso-added.txt
+**/sso-pending.txt
+**/sso.txt
+**/account.txt
+**/accounts.json
+**/accounts.jsonl
+**/*.jsonl
+**/*.log
+**/__pycache__/
+*.pyc
+.DS_Store
