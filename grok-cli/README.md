@@ -10,8 +10,8 @@ Injects SSO cookies into Chrome, clicks Continue/Allow on x.ai, polls 9router un
 cd grok-cli
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chrome
-python main.py setup
+.venv/bin/playwright install chromium
+.venv/bin/python main.py setup
 ```
 
 ## Config (`.env`)
@@ -32,13 +32,13 @@ Paste accounts into `sso-pending.txt` (one JSON per line):
 ## Usage
 
 ```bash
-python main.py                          # add pending accounts to 9router
-python main.py --workers 2 --rounds 3
-python main.py --show                   # visible browser (debug)
-python main.py --from path.jsonl        # custom source file
-python main.py setup                    # first-time setup
-python main.py split                    # reconcile local vs 9router
-python main.py status                   # read-only counts
+.venv/bin/python main.py                          # add pending accounts to 9router
+.venv/bin/python main.py --workers 2 --rounds 3
+.venv/bin/python main.py --show                   # visible browser (debug)
+.venv/bin/python main.py --from path.jsonl        # custom source file
+.venv/bin/python main.py setup                    # first-time setup
+.venv/bin/python main.py split                    # reconcile local vs 9router
+.venv/bin/python main.py status                   # read-only counts
 ```
 
 ## Troubleshooting
