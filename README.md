@@ -1,56 +1,26 @@
 # 9r-bulk-add
 
-Bulk-add accounts ke **9router**.
-
-Tiap **provider** = satu folder. Jalankan script **di dalam folder provider** (tidak ada launcher di root).
+Bulk-add accounts to [9router](https://github.com) via OAuth device-code flow.
 
 ```
 9r-bulk-add/
-├── README.md          ← ini
-└── grok-cli/          ← provider Grok CLI (x.ai)
-    ├── add.py
-    ├── run.sh | run.bat | run.ps1
-    ├── requirements.txt
-    ├── .env.example
-    └── README.md
+└── grok-cli/       ← Grok CLI (x.ai)
 ```
 
-Nanti provider lain: `codex/`, `claude/`, … pola yang sama.
-
----
-
-## Provider
-
-| Folder | Platform | Docs |
-|--------|----------|------|
-| [`grok-cli/`](grok-cli/) | Grok CLI / x.ai device-code | [grok-cli/README.md](grok-cli/README.md) |
-
----
-
-## Cara pakai (umum)
-
-1. Masuk folder provider  
-2. Setup venv + `.env` (lihat README provider)  
-3. Jalankan `./run.sh` / `run.bat` / `.\run.ps1`
+## Quick Start
 
 ```bash
-# contoh Grok CLI — Linux/macOS
 cd grok-cli
-./run.sh split
-./run.sh auto --pending --workers 2
-./run.sh manual 3
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/playwright install chrome
 
-# Windows
-cd grok-cli
-run.bat split
-run.bat auto --pending
-run.bat manual 3
+python main.py setup    # creates .env, sso-pending.txt, sso-added.txt
+# edit .env → set ROUTER9_URL and ROUTER9_PASS
+# paste accounts into sso-pending.txt
+
+python main.py          # add pending accounts to 9router
+python main.py split    # reconcile local files vs 9router
 ```
 
----
-
-## Catatan
-
-- Signup tetap di `../grok-sign-up/`
-- Kredensial / `sso-*.txt` di-gitignore per provider
-- OS: Linux · macOS · Windows (detail di README masing-masing provider)
+See [grok-cli/README.md](grok-cli/README.md) for details.

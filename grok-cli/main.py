@@ -1,61 +1,55 @@
 #!/usr/bin/env python3
 """9r-bulk-add / grok-cli — push Grok accounts to 9router.
 
-Modes:
-  auto    inject SSO cookies + browser Continue/Allow (batch from pending)
-  manual  export pending → account.txt (email + password) for hand login/connect
-  split   sso-pending.txt vs sso-added.txt via 9router API
-  status  counts only
+Usage:
+  python main.py                         # add pending accounts to 9router
+  python main.py --workers 2 --rounds 3
+  python main.py --show                  # visible browser (debug)
+  python main.py --from path.jsonl
+  python main.py setup                   # first-time setup (.env + data files)
+  python main.py split                   # reconcile local vs 9router
+  python main.py status                  # read-only counts
 """
-import sys, time, re, json, secrets, shutil, os, subprocess, glob, threading, queue as queue_mod
+import sys, time, json, secrets, shutil, os, platform, threading, queue as queue_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import curl_cffi.requests as creq
 
 # ── Config ────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent
+
 _env = {}
-_envfile = Path(__file__).parent / '.env'
+_envfile = ROOT / '.env'
 if _envfile.exists():
     for line in _envfile.read_text().splitlines():
         if '=' in line and not line.startswith('#'):
             k, v = line.split('=', 1)
             _env[k.strip()] = v.strip()
 
-def _env_or(key, default=''):
+def _cfg(key, default=''):
     return _env.get(key, default)
 
-ROOT = Path(__file__).parent
-ROUTER9 = _env_or('ROUTER9_URL', 'https://your-9router.example').rstrip('/')
-ROUTER9_PASS = _env_or('ROUTER9_PASS', '')
-_DEVICE_CODE_GAP = max(3.0, float(_env_or('DEVICE_CODE_GAP', '4')))
-# accounts: paste into sso-pending.txt (python setup creates empty files)
+ROUTER9 = _cfg('ROUTER9_URL', 'https://your-9router.example').rstrip('/')
+ROUTER9_PASS = _cfg('ROUTER9_PASS', '')
+_DEVICE_CODE_GAP = max(3.0, float(_cfg('DEVICE_CODE_GAP', '4')))
 SSO_ADDED = ROOT / 'sso-added.txt'
 SSO_PENDING = ROOT / 'sso-pending.txt'
-ACCOUNT_TXT = ROOT / 'account.txt'
-_sso_raw = _env_or('SSO_FILE', str(SSO_PENDING))
-SSO_FILE = Path(_sso_raw)
-if not SSO_FILE.is_absolute():
-    SSO_FILE = (ROOT / SSO_FILE).resolve()
 IS_MAC = sys.platform == 'darwin'
 IS_LINUX = sys.platform.startswith('linux')
 IS_WIN = sys.platform == 'win32'
-HIDE_BROWSER = True
 
 def _find_chrome():
-    env = _env_or('CHROME_BIN', '')
+    env = _cfg('CHROME_BIN', '')
     if env and Path(env).exists():
         return env
     candidates = [
-        # Linux
         '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome',
         '/usr/bin/chromium', '/usr/bin/chromium-browser',
-        # macOS
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         '/Applications/Chromium.app/Contents/MacOS/Chromium',
         str(Path.home() / 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
     ]
-    # Windows
     if IS_WIN:
         pf = os.environ.get('PROGRAMFILES', r'C:\Program Files')
         pf86 = os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')
@@ -82,10 +76,10 @@ _out_lock = threading.Lock()
 def ok(msg):
     with _print_lock:
         print(f"    {GRN}✓{RST} {msg}")
-def no(msg):
+def fail(msg):
     with _print_lock:
         print(f"    {RED}✗{RST} {msg}")
-def wait(msg):
+def info(msg):
     with _print_lock:
         print(f"    {YEL}→{RST} {msg}")
 
@@ -119,8 +113,8 @@ def load_accounts(path):
     out = []
     if not path.exists():
         return out
-    for l in path.read_text().splitlines():
-        s = l.strip()
+    for line in path.read_text().splitlines():
+        s = line.strip()
         if not s or s.startswith('#') or '"email"' not in s:
             continue
         try:
@@ -145,24 +139,24 @@ def promote_to_added(accs):
             left = [a for a in load_accounts(SSO_PENDING) if a.get('email') not in by]
             SSO_PENDING.write_text(''.join(json.dumps(a) + '\n' for a in left))
 
-def split_accounts(write=True):
-    """Reconcile local pending+added files against 9router (no external sso dump)."""
+# ── Split / Status ────────────────────────────────────────────
+def cmd_split(write=True):
+    """Reconcile local pending+added files against 9router."""
     print(f"\n{CYN} ─── [ SPLIT ↔ 9ROUTER ] ──{'─'*44}{RST}")
     r9 = Router9()
     if not r9.login():
-        no("9router login failed"); return
+        fail("9router login failed"); return
     ok("9router login")
     existing = {c.get('email') for c in r9.list_grok() if c.get('email')}
 
-    # merge local files (pending + added + optional SSO_FILE)
     by = {}
-    for path in (SSO_PENDING, SSO_ADDED, SSO_FILE):
+    for path in (SSO_PENDING, SSO_ADDED):
         for a in load_accounts(path):
             e = a.get('email')
             if e:
                 by[e] = a
     if not by:
-        no("no local accounts — paste into sso-pending.txt (python setup)")
+        fail("no local accounts — paste into sso-pending.txt (python main.py setup)")
         print(f"  {GRN}di 9router (grok-cli){RST}: {len(existing)}")
         return
 
@@ -176,13 +170,46 @@ def split_accounts(write=True):
     if only_r:
         print(f"  {DIM}di 9router saja (tidak di file lokal): {len(only_r)}{RST}")
     if write:
-        # preserve comment header in pending if any
         SSO_ADDED.write_text(''.join(json.dumps(a) + '\n' for a in added))
-        body = ''.join(json.dumps(a) + '\n' for a in pending)
-        SSO_PENDING.write_text(body)
+        SSO_PENDING.write_text(''.join(json.dumps(a) + '\n' for a in pending))
         ok(f"wrote {SSO_ADDED.name} ({len(added)})")
         ok(f"wrote {SSO_PENDING.name} ({len(pending)})")
-        wait("push: python run auto")
+
+# ── Setup ─────────────────────────────────────────────────────
+_PENDING_HEADER = """\
+# Paste account JSON lines below (one per line).
+# Example:
+# {"email":"user@example.com","sso_cookies":[{"name":"sso","value":"...","domain":".x.ai","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax"}]}
+"""
+
+def cmd_setup():
+    """First-time setup: .env + sso-pending.txt + sso-added.txt."""
+    env_file = ROOT / '.env'
+    env_example = ROOT / '.env.example'
+    print(f"\n{CYN} ─── [ SETUP ] ──{'─'*52}{RST}")
+    if env_file.exists():
+        print("    .env already exists — skip")
+    elif env_example.exists():
+        shutil.copy(env_example, env_file)
+        ok("created .env from .env.example  (edit ROUTER9_URL / ROUTER9_PASS)")
+    else:
+        fail(".env.example missing")
+
+    if SSO_PENDING.exists():
+        print("    sso-pending.txt already exists — skip")
+    else:
+        SSO_PENDING.write_text(_PENDING_HEADER, encoding='utf-8')
+        ok("created sso-pending.txt  (paste accounts here)")
+
+    if SSO_ADDED.exists():
+        print("    sso-added.txt already exists — skip")
+    else:
+        SSO_ADDED.write_text('', encoding='utf-8')
+        ok("created sso-added.txt  (auto-filled on success)")
+
+    print(f"\n    1) edit .env")
+    print(f"    2) paste accounts into sso-pending.txt")
+    print(f"    3) python main.py")
 
 # ── Cookies / browser helpers ─────────────────────────────────
 def _sso_cookies_pw(acc):
@@ -238,7 +265,7 @@ def _device_code_throttled(r9, retries=6):
             return d
         if any(x in blob.lower() for x in ('slow_down', 'too many', '429')):
             sleep_for = min(8 + i * 6, 45)
-            wait(f"device-code slow_down — sleep {sleep_for}s ({i+1}/{retries})")
+            info(f"device-code slow_down — sleep {sleep_for}s ({i+1}/{retries})")
             time.sleep(sleep_for)
             last_err = blob[:80]
             continue
@@ -392,18 +419,18 @@ def _poll(r9, d, max_s=40):
         time.sleep(1.2)
     return 'fail', 'poll timeout'
 
-# ── AUTO mode (browser workers) ───────────────────────────────
+# ── Workers ───────────────────────────────────────────────────
 def _worker(wid, job_q, existing, hide, stats, lock, total):
     r9 = Router9()
     if not r9.login():
-        wait(f"w{wid}: login failed")
+        info(f"w{wid}: login failed")
         return
     tmp_root = Path(os.environ.get('TEMP') or os.environ.get('TMP') or '/tmp')
     profile = tmp_root / f"9r-add-w{wid}-{os.getpid()}-{secrets.token_hex(3)}"
     env_saved = _force_x11_env() if (hide and IS_LINUX) else {}
     try:
         with sync_playwright() as p:
-            wait(f"w{wid}: chrome ready")
+            info(f"w{wid}: chrome ready")
             ctx = p.chromium.launch_persistent_context(**_pw_kwargs(profile, hide))
             page = ctx.new_page()
             try:
@@ -454,10 +481,10 @@ def _worker(wid, job_q, existing, hide, stats, lock, total):
                             n = stats['done']
                             if retryable and stats.get('round', 1) < stats.get('rounds', 3):
                                 stats.setdefault('retry', []).append(acc)
-                                wait(f"[{n}/{total}] w{wid} {email} — {err[:55]} (retry)")
+                                info(f"[{n}/{total}] w{wid} {email} — {err[:55]} (retry)")
                             else:
                                 stats['failed'] += 1
-                                no(f"[{n}/{total}] w{wid} {email} — {err[:70]}")
+                                fail(f"[{n}/{total}] w{wid} {email} — {err[:70]}")
                     finally:
                         job_q.task_done()
             finally:
@@ -466,17 +493,17 @@ def _worker(wid, job_q, existing, hide, stats, lock, total):
                 except Exception:
                     pass
     except Exception as e:
-        no(f"w{wid} crash: {e}")
+        fail(f"w{wid} crash: {e}")
     finally:
         if env_saved:
             _restore_env(env_saved)
         shutil.rmtree(profile, ignore_errors=True)
 
-def run_auto(accounts, workers=2, hide=True, rounds=3):
-    print(f"\n{CYN} ─── [ AUTO → 9ROUTER ] ──{'─'*42}{RST}")
+def cmd_add(accounts, workers=2, hide=True, rounds=3):
+    print(f"\n{CYN} ─── [ ADD → 9ROUTER ] ──{'─'*43}{RST}")
     r9 = Router9()
     if not r9.login():
-        no("9router login failed"); return
+        fail("9router login failed"); return
     ok("9router login")
     existing = {c.get('email') for c in r9.list_grok() if c.get('email')}
 
@@ -488,7 +515,7 @@ def run_auto(accounts, workers=2, hide=True, rounds=3):
             base.append(a)
 
     workers = max(1, min(workers, 4))
-    wait(f"queue {len(base)} | workers={workers} | rounds≤{rounds} | gap≥{_DEVICE_CODE_GAP}s")
+    info(f"queue {len(base)} | workers={workers} | rounds≤{rounds} | gap≥{_DEVICE_CODE_GAP}s")
 
     stats = {'added': 0, 'skipped': 0, 'failed': 0, 'done': 0, 'retry': [], 'rounds': rounds}
     lock = threading.Lock()
@@ -505,7 +532,7 @@ def run_auto(accounts, workers=2, hide=True, rounds=3):
         stats['round'] = rnd
         stats['retry'] = []
         if rnd > 1:
-            wait(f"round {rnd}/{rounds}: retry {len(todo)}")
+            info(f"round {rnd}/{rounds}: retry {len(todo)}")
             time.sleep(3)
         total = len(todo)
         stats['done'] = 0
@@ -521,60 +548,15 @@ def run_auto(accounts, workers=2, hide=True, rounds=3):
                 try:
                     f.result()
                 except Exception as e:
-                    no(f"worker crash: {e}")
+                    fail(f"worker crash: {e}")
         todo = list(stats.get('retry') or [])
 
     for a in todo:
-        no(f"give up: {a.get('email')}")
+        fail(f"give up: {a.get('email')}")
         stats['failed'] += 1
 
     print(f"  {GRN}added{RST}: {stats['added']}  {YEL}skipped{RST}: {stats['skipped']}  {RED}failed{RST}: {stats['failed']}")
     print(f"  files: {SSO_ADDED.name}={len(load_accounts(SSO_ADDED))}  {SSO_PENDING.name}={len(load_accounts(SSO_PENDING))}")
-
-# ── MANUAL mode: export pending → account.txt ─────────────────
-def run_manual(limit=None, fmt='colon'):
-    """Export sso-pending.txt → account.txt (email + password only).
-
-    User then logs into x.ai and connects 9router manually.
-    Does not open browser or call device-code.
-    """
-    print(f"\n{CYN} ─── [ MANUAL EXPORT ] ──{'─'*44}{RST}")
-    accounts = load_accounts(SSO_PENDING)
-    if not accounts:
-        no(f"no accounts in {SSO_PENDING.name} — paste JSON lines first (python setup)")
-        return
-
-    if limit is not None and limit > 0:
-        accounts = accounts[:limit]
-
-    lines = []
-    skipped = 0
-    for a in accounts:
-        email = (a.get('email') or '').strip()
-        password = (a.get('password') or '').strip()
-        if not email:
-            skipped += 1
-            continue
-        if not password:
-            wait(f"skip {email} (no password field)")
-            skipped += 1
-            continue
-        if fmt == 'space':
-            lines.append(f"{email} {password}")
-        else:
-            lines.append(f"{email}:{password}")
-
-    if not lines:
-        no("nothing to export (need email + password on each pending line)")
-        return
-
-    ACCOUNT_TXT.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    ok(f"wrote {ACCOUNT_TXT.name}  ({len(lines)} akun)")
-    if skipped:
-        wait(f"skipped {skipped} baris tanpa email/password")
-    print(f"  format   : email:password  (satu baris per akun)")
-    print(f"  path     : {ACCOUNT_TXT}")
-    wait("login x.ai + connect 9router manual pakai daftar di account.txt")
 
 # ── CLI ───────────────────────────────────────────────────────
 def _flag_int(args, name, default):
@@ -585,82 +567,49 @@ def _flag_int(args, name, default):
     return default
 
 def main():
-    global HIDE_BROWSER
     args = sys.argv[1:]
-    if not args or args[0] in ('-h', '--help'):
-        print("""
-9r-bulk-add / grok-cli — push Grok accounts to 9router
-
-  python setup                           # .env + sso-pending.txt + sso-added.txt
-  python run split
-  python run status
-  python run auto [--workers N] [--rounds R] [--show]
-  python run auto --from path.jsonl
-  python run manual [N]                  # pending → account.txt (email:password)
-  python run --os linux|mac|win …
-
-  auto   = browser inject SSO + Continue/Allow
-  manual = kamu login x.ai + connect 9router sendiri; skrip hanya export kredensial
-
-Env (.env): ROUTER9_URL, ROUTER9_PASS, DEVICE_CODE_GAP, CHROME_BIN
-""".strip())
+    if args and args[0] in ('-h', '--help'):
+        print(__doc__.strip())
         return
 
-    cmd = args[0]
-    HIDE_BROWSER = '--show' not in args
+    cmd = args[0] if args else None
 
-    if cmd in ('split', '--split'):
-        split_accounts(write=True)
+    if cmd == 'setup':
+        cmd_setup()
         return
-    if cmd in ('status', '--status'):
-        split_accounts(write=False)
-        return
-
-    if cmd in ('manual', '--manual', 'export', '--export'):
-        n = None
-        fmt = 'colon'
-        for a in args[1:]:
-            if a.lstrip('-').isdigit():
-                n = int(a)
-            elif a in ('--space',):
-                fmt = 'space'
-        run_manual(limit=n, fmt=fmt)
+    if cmd in ('split', 'status'):
+        cmd_split(write=(cmd == 'split'))
         return
 
-    if cmd in ('auto', '--auto', 'add'):
-        # default: sso-pending.txt (paste accounts there after setup)
-        src = SSO_PENDING
-        if '--from' in args:
-            i = args.index('--from')
+    # default: add accounts
+    hide = '--show' not in args
+    src = SSO_PENDING
+    if '--from' in args:
+        i = args.index('--from')
+        if i + 1 < len(args):
+            src = Path(args[i + 1])
+            if not src.is_absolute():
+                src = (ROOT / src).resolve()
+    accounts = load_accounts(src)
+    skip = set()
+    for name in ('--workers', '--rounds', '--from'):
+        if name in args:
+            i = args.index(name)
+            skip.add(i)
             if i + 1 < len(args):
-                src = Path(args[i + 1])
-                if not src.is_absolute():
-                    src = (ROOT / src).resolve()
-        elif '--all' in args:
-            src = SSO_FILE
-        accounts = load_accounts(src)
-        skip = set()
-        for name in ('--workers', '--rounds', '--from'):
-            if name in args:
-                i = args.index(name)
-                skip.add(i)
-                if i + 1 < len(args):
-                    skip.add(i + 1)
-        for i, a in enumerate(args):
-            if i in skip or i == 0:
-                continue
-            if a.lstrip('-').isdigit():
-                accounts = accounts[-int(a):]
-                break
-        workers = max(1, min(_flag_int(args, '--workers', 2), 4))
-        rounds = max(1, _flag_int(args, '--rounds', 3))
-        if not accounts:
-            no(f"no accounts in {src} — paste JSON lines into sso-pending.txt (python setup)"); return
-        wait(f"{len(accounts)} akun dari {src.name}")
-        run_auto(accounts, workers=workers, hide=HIDE_BROWSER, rounds=rounds)
-        return
-
-    no(f"unknown command: {cmd} — try --help")
+                skip.add(i + 1)
+    for i, a in enumerate(args):
+        if i in skip:
+            continue
+        if a.lstrip('-').isdigit():
+            accounts = accounts[-int(a):]
+            break
+    workers = max(1, min(_flag_int(args, '--workers', 2), 4))
+    rounds = max(1, _flag_int(args, '--rounds', 3))
+    if not accounts:
+        fail(f"no accounts in {src} — paste JSON lines into sso-pending.txt (python main.py setup)"); return
+    info(f"{len(accounts)} akun dari {src.name}")
+    cmd_add(accounts, workers=workers, hide=hide, rounds=rounds)
 
 if __name__ == '__main__':
     main()
