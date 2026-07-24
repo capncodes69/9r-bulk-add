@@ -9,23 +9,25 @@ flow. One tool for all providers — selected via **flag** (not folders).
 
 Adds Grok CLI accounts to 9router (provider slug: `grok-cli`).
 
-- **Input**: `input/grok.txt` — one JSON per line with `sso_cookies[]`
-  containing an `sso` cookie (grabbed from an x.ai session).
+- **Input**: `input/grok.json` — a JSON array of accounts, each with
+  `sso_cookies[]` containing an `sso` cookie (grabbed from an x.ai session).
 - **Flow**: warms up the session on `accounts.x.ai`, plants the sso cookies
   (fanned out to all x.ai / grok.com domains), opens the 9router device URL,
   clicks **Allow**, then polls 9router until linked.
 - **Poll timeout**: 40s (fixed).
 
 ```json
-{"email":"user@example.com","sso_cookies":[{"name":"sso","value":"...","domain":".x.ai","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax"}]}
+[
+  {"email":"user@example.com","sso_cookies":[{"name":"sso","value":"...","domain":".x.ai","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax"}]}
+]
 ```
 
 ### `--qoder` — Qoder (qoder.com)
 
 Adds Qoder accounts to 9router (provider slug: `qoder`).
 
-- **Input**: `input/qoder.txt` — one JSON per line with `cookies[]`
-  containing `qoder_session_cookie`.
+- **Input**: `input/qoder.json` — a JSON array of accounts, each with
+  `cookies[]` containing `qoder_session_cookie`.
 - **Flow**: plants the account's qoder.com cookies, opens the 9router device
   URL directly (`qoder.com/device/selectAccounts?...`), clicks the account
   card matching the email, clicks **Authorize** (plus a second confirm when
@@ -35,17 +37,32 @@ Adds Qoder accounts to 9router (provider slug: `qoder`).
 - **Poll timeout**: `POLL_TIMEOUT` seconds (default 180).
 
 ```json
-{"email":"user@example.com","cookies":[{"name":"qoder_session_cookie","value":"...","domain":".qoder.com","path":"/"}]}
+[
+  {"email":"user@example.com","cookies":[{"name":"qoder_session_cookie","value":"...","domain":".qoder.com","path":"/"}]}
+]
 ```
 
 ### Summary
 
 | Flag | Provider | 9router slug | Input | Output | Session cookie |
 |------|----------|--------------|-----------------|----------------|----------------|
-| `--grok` | Grok CLI (x.ai) | `grok-cli` | `input/grok.txt` | `output/grok.txt` | `sso` in `sso_cookies[]` |
-| `--qoder` | Qoder (qoder.com) | `qoder` | `input/qoder.txt` | `output/qoder.txt` | `qoder_session_cookie` in `cookies[]` |
+| `--grok` | Grok CLI (x.ai) | `grok-cli` | `input/grok.json` | `output/grok.md` | `sso` in `sso_cookies[]` |
+| `--qoder` | Qoder (qoder.com) | `qoder` | `input/qoder.json` | `output/qoder.md` | `qoder_session_cookie` in `cookies[]` |
 
-Once an account is linked, it moves from `input/` to `output/`.
+Once an account is linked, it moves from `input/` to `output/`. The output
+is a human-readable **markdown table** (`output/<provider>.md`) holding **slim**
+records only — session/cookies are stripped; just `email`, `password`, and a
+human-readable timestamp of when it was added:
+
+```markdown
+# Linked accounts — QODER (1)
+
+| # | Email | Password | Added at |
+|---|-------|----------|----------|
+| 1 | user@example.com | s3cret-pw | 2026-07-25 02:17:20 |
+```
+
+> Note: `--from` still accepts JSONL files (one JSON per line) for imports.
 
 ## Install
 
@@ -74,7 +91,7 @@ POLL_TIMEOUT=180
 .venv/bin/python main.py --qoder --workers 2 --rounds 3
 .venv/bin/python main.py --qoder --show                  # visible browser (debug)
 .venv/bin/python main.py --grok -v                       # verbose logs
-.venv/bin/python main.py --qoder --from path.jsonl       # custom source file
+.venv/bin/python main.py --qoder --from path.jsonl       # custom source (JSON/JSONL)
 .venv/bin/python main.py --qoder 5                       # only the last 5 accounts
 .venv/bin/python main.py setup                           # first-time setup
 .venv/bin/python main.py split  [--grok|--qoder]         # reconcile local vs 9router

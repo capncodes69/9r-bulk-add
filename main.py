@@ -16,7 +16,7 @@ Usage:
   python main.py split  [--grok|--qoder]           # reconcile local vs 9router
   python main.py status [--grok|--qoder]           # read-only counts (both if no flag)
 """
-import sys, time, json, secrets, shutil, os, threading, queue as queue_mod
+import sys, time, re, json, secrets, shutil, os, threading, queue as queue_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -40,8 +40,8 @@ ROUTER9 = _cfg('ROUTER9_URL', 'https://your-9router.example').rstrip('/')
 ROUTER9_PASS = _cfg('ROUTER9_PASS', '')
 _DEVICE_CODE_GAP = max(3.0, float(_cfg('DEVICE_CODE_GAP', '4')))
 POLL_TIMEOUT = int(_cfg('POLL_TIMEOUT', '180'))   # qoder (grok uses fixed 40s)
-INPUT_DIR = ROOT / 'input'     # accounts to add (paste JSON lines here)
-OUTPUT_DIR = ROOT / 'output'   # accounts successfully linked
+INPUT_DIR = ROOT / 'input'     # accounts to add — input/<provider>.json
+OUTPUT_DIR = ROOT / 'output'   # linked accounts — output/<provider>.md
 IS_MAC = sys.platform == 'darwin'
 IS_LINUX = sys.platform.startswith('linux')
 IS_WIN = sys.platform == 'win32'
@@ -120,15 +120,67 @@ class Router9:
         return [c for c in conns if c.get('provider') == slug]
 
 # ── Account files ─────────────────────────────────────────────
+# input/<provider>.json  → JSON array of full account records (session/cookies)
+# output/<provider>.md   → markdown table of slim records {email, password, timestamp}
 def _write_lines(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
 
-def load_accounts(path):
-    path = Path(path)
+def _rel(path):
+    """Display path relative to ROOT (input/grok.json, output/grok.md)."""
+    try:
+        return str(Path(path).relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+def _now_str():
+    return time.strftime('%Y-%m-%d %H:%M:%S')
+
+def _slim(acc, ts=None):
+    """Output record: email + password + timestamp only — no session/cookies."""
+    return {'email': acc.get('email', ''),
+            'password': acc.get('password', ''),
+            'timestamp': ts or _now_str()}
+
+def _md_cell(v):
+    return str(v or '').replace('|', '\\|')
+
+def _output_md(prof, recs):
+    recs = list(recs)
+    lines = [f"# Linked accounts — {prof['label']} ({len(recs)})", '',
+             '| # | Email | Password | Added at |',
+             '|---|-------|----------|----------|']
+    for i, a in enumerate(recs, 1):
+        lines.append(f"| {i} | {_md_cell(a.get('email'))} | {_md_cell(a.get('password'))}"
+                     f" | {_md_cell(a.get('timestamp'))} |")
+    return '\n'.join(lines) + '\n'
+
+def _load_output_md(path):
     out = []
+    for line in Path(path).read_text().splitlines():
+        s = line.strip()
+        if not s.startswith('|'):
+            continue
+        cells = [c.strip().replace('\\|', '|') for c in re.split(r'(?<!\\)\|', s.strip('|'))]
+        if len(cells) < 4 or cells[1].lower() == 'email' or set(cells[0]) <= {'-'}:
+            continue
+        out.append({'email': cells[1], 'password': cells[2], 'timestamp': cells[3]})
+    return out
+
+def load_accounts(path):
+    """Read accounts from .json (array), .md (output table) or JSONL (.txt/.jsonl)."""
+    path = Path(path)
     if not path.exists():
-        return out
+        return []
+    if path.suffix == '.json':
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return []
+        return [a for a in data if isinstance(a, dict)] if isinstance(data, list) else []
+    if path.suffix == '.md':
+        return _load_output_md(path)
+    out = []
     for line in path.read_text().splitlines():
         s = line.strip()
         if not s or s.startswith('#') or '"email"' not in s:
@@ -139,7 +191,15 @@ def load_accounts(path):
             pass
     return out
 
+def _write_input(path, accounts):
+    _write_lines(path, json.dumps(list(accounts), indent=2, ensure_ascii=False) + '\n')
+
+def _write_output(prof, recs):
+    _write_lines(prof['output'], _output_md(prof, recs))
+
 def promote_to_output(prof, accs):
+    """Move accounts from input → output. Output records are slimmed to
+    {email, password, timestamp} — session/cookies are NOT carried over."""
     if not accs:
         return
     if isinstance(accs, dict):
@@ -147,13 +207,16 @@ def promote_to_output(prof, accs):
     by = {a.get('email'): a for a in accs if a.get('email')}
     if not by:
         return
+    now = _now_str()
     with _out_lock:
         out_map = {a['email']: a for a in load_accounts(prof['output']) if a.get('email')}
-        out_map.update(by)
-        _write_lines(prof['output'], ''.join(json.dumps(a) + '\n' for a in out_map.values()))
+        for e, a in by.items():
+            ts = (out_map.get(e) or {}).get('timestamp') or now
+            out_map[e] = _slim(a, ts)
+        _write_output(prof, out_map.values())
         if prof['input'].exists():
             left = [a for a in load_accounts(prof['input']) if a.get('email') not in by]
-            _write_lines(prof['input'], ''.join(json.dumps(a) + '\n' for a in left))
+            _write_input(prof['input'], left)
 
 # ── Split / Status ────────────────────────────────────────────
 def cmd_split(prof, write=True):
@@ -166,13 +229,14 @@ def cmd_split(prof, write=True):
     existing = {c.get('email') for c in r9.list_conns(prof['slug']) if c.get('email')}
 
     by = {}
-    for path in (prof['input'], prof['output']):
+    # output (slim) first, input (full) last → full records win on duplicates
+    for path in (prof['output'], prof['input']):
         for a in load_accounts(path):
             e = a.get('email')
             if e:
                 by[e] = a
     if not by:
-        fail(f"no local accounts — paste into {prof['input'].name} (python main.py setup)")
+        fail(f"no local accounts — paste into {_rel(prof['input'])} (python main.py setup)")
         print(f"  {GRN}in 9router ({prof['slug']}){RST}: {len(existing)}")
         return
 
@@ -186,10 +250,16 @@ def cmd_split(prof, write=True):
     if only_r:
         print(f"  {DIM}in 9router only (not in local files): {len(only_r)}{RST}")
     if write:
-        _write_lines(prof['output'], ''.join(json.dumps(a) + '\n' for a in linked))
-        _write_lines(prof['input'], ''.join(json.dumps(a) + '\n' for a in queued))
-        ok(f"wrote {prof['output'].name} ({len(linked)})")
-        ok(f"wrote {prof['input'].name} ({len(queued)})")
+        # output holds slim records {email, password, timestamp} — keep the
+        # original 'added at' timestamp for emails already present
+        prev = {a.get('email'): a for a in load_accounts(prof['output'])}
+        now = _now_str()
+        out_recs = [_slim(a, (prev.get(a['email']) or {}).get('timestamp') or now)
+                    for a in linked]
+        _write_output(prof, out_recs)
+        _write_input(prof['input'], queued)
+        ok(f"wrote {_rel(prof['output'])} ({len(linked)})")
+        ok(f"wrote {_rel(prof['input'])} ({len(queued)})")
 
 # ── Setup ─────────────────────────────────────────────────────
 def cmd_setup():
@@ -206,16 +276,19 @@ def cmd_setup():
         fail(".env.example missing")
 
     for prof in PROFILES.values():
-        for path, header in ((prof['input'], prof['input_header']), (prof['output'], '')):
-            if path.exists():
-                print(f"    {path.name} already exists — skip")
-            else:
-                _write_lines(path, header)
-                note = 'paste accounts here' if header else 'auto-filled on success'
-                ok(f"created {path.name}  ({note})")
+        if prof['input'].exists():
+            print(f"    {_rel(prof['input'])} already exists — skip")
+        else:
+            _write_input(prof['input'], [])
+            ok(f"created {_rel(prof['input'])}  (paste accounts here)")
+        if prof['output'].exists():
+            print(f"    {_rel(prof['output'])} already exists — skip")
+        else:
+            _write_output(prof, [])
+            ok(f"created {_rel(prof['output'])}  (auto-filled on success)")
 
     print(f"\n    1) edit .env (ROUTER9_URL / ROUTER9_PASS)")
-    print(f"    2) paste accounts into input/grok.txt / input/qoder.txt")
+    print(f"    2) add accounts to input/grok.json / input/qoder.json")
     print(f"    3) python main.py --grok   /   python main.py --qoder")
 
 # ── Browser helpers (shared) ──────────────────────────────────
@@ -551,8 +624,8 @@ PROFILES = {
     'grok': {
         'label': 'GROK',
         'slug': 'grok-cli',
-        'input': INPUT_DIR / 'grok.txt',
-        'output': OUTPUT_DIR / 'grok.txt',
+        'input': INPUT_DIR / 'grok.json',
+        'output': OUTPUT_DIR / 'grok.md',
         'viewport': (800, 600),
         'poll_timeout': 40,
         'session_name': 'sso',
@@ -560,17 +633,12 @@ PROFILES = {
         'has_session': _grok_has_session,
         'cookies_pw': _grok_cookies_pw,
         'approve': _approve_grok,
-        'input_header': """\
-# Paste account JSON lines below (one per line).
-# Example:
-# {"email":"user@example.com","sso_cookies":[{"name":"sso","value":"...","domain":".x.ai","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax"}]}
-""",
     },
     'qoder': {
         'label': 'QODER',
         'slug': 'qoder',
-        'input': INPUT_DIR / 'qoder.txt',
-        'output': OUTPUT_DIR / 'qoder.txt',
+        'input': INPUT_DIR / 'qoder.json',
+        'output': OUTPUT_DIR / 'qoder.md',
         'viewport': (1280, 900),
         'poll_timeout': POLL_TIMEOUT,
         'session_name': 'qoder_session_cookie',
@@ -578,12 +646,6 @@ PROFILES = {
         'has_session': _qoder_has_session,
         'cookies_pw': _qoder_cookies_pw,
         'approve': _approve_qoder,
-        'input_header': """\
-# Paste account JSON lines below (one per line). Each entry must have
-# cookies[] containing qoder_session_cookie.
-# Example:
-# {"email":"user@example.com","cookies":[{"name":"qoder_session_cookie","value":"...","domain":".qoder.com","path":"/"}]}
-""",
     },
 }
 
@@ -787,7 +849,7 @@ def cmd_add(accounts, prof, workers=2, hide=True, rounds=3):
         stats['failed'] += 1
 
     print(f"  {GRN}linked{RST}: {stats['linked']}  {YEL}skipped{RST}: {stats['skipped']}  {RED}failed{RST}: {stats['failed']}")
-    print(f"  files: {prof['output'].name}={len(load_accounts(prof['output']))}  {prof['input'].name}={len(load_accounts(prof['input']))}")
+    print(f"  files: {_rel(prof['output'])}={len(load_accounts(prof['output']))}  {_rel(prof['input'])}={len(load_accounts(prof['input']))}")
 
 # ── CLI ───────────────────────────────────────────────────────
 def _flag_int(args, name, default):
@@ -850,10 +912,10 @@ def main():
     workers = max(1, min(_flag_int(args, '--workers', 2), 4))
     rounds = max(1, _flag_int(args, '--rounds', 3))
     if not accounts:
-        fail(f"no accounts in {src} — paste JSON lines into {prof['input'].name} (python main.py setup)")
+        fail(f"no accounts in {_rel(src)} — add accounts to {_rel(prof['input'])} (python main.py setup)")
         return
     n_sess = sum(1 for a in accounts if prof['has_session'](a))
-    info(f"{len(accounts)} accounts from {src.name} ({n_sess} with {prof['session_name']})")
+    info(f"{len(accounts)} accounts from {_rel(src)} ({n_sess} with {prof['session_name']})")
     cmd_add(accounts, prof, workers=workers, hide=hide, rounds=rounds)
 
 if __name__ == '__main__':
