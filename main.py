@@ -342,14 +342,26 @@ def _pw_kwargs(profile_dir, prof, hide=True):
     return kw
 
 def _dismiss_cookies(page):
-    for name in ('Allow All', 'Accept All', 'Accept All Cookies', 'Accept all',
-                 'Accept', 'Agree', 'Reject All'):
-        try:
-            page.get_by_role('button', name=name, exact=False).click(timeout=1000)
+    """Click a cookie-consent button if present (single fast JS pass)."""
+    try:
+        hit = page.evaluate(r"""() => {
+          const kws = ['allow all', 'accept all', 'accept all cookies', 'accept', 'agree', 'reject all'];
+          const nodes = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+          const b = nodes.find(n => {
+            const t = (n.innerText || n.textContent || '').trim().toLowerCase();
+            if (!t || t.length > 30) return false;
+            const s = getComputedStyle(n);
+            const r = n.getBoundingClientRect();
+            return s.display !== 'none' && r.width > 0 && r.height > 0 && kws.includes(t);
+          });
+          if (!b) return false;
+          b.click(); return true;
+        }""")
+        if hit:
             time.sleep(0.3)
             return True
-        except Exception:
-            pass
+    except Exception:
+        pass
     return False
 
 def _norm_cookie(cc, default_domain):
@@ -517,14 +529,6 @@ def _select_account(page, email):
             const c = clickable(nodes[0]) || nodes[0];
             c.click(); return 'email:' + ((c.innerText || '').slice(0, 40));
           }
-          const cards = Array.from(document.querySelectorAll(
-            '.ant-list-item,[class*="account"],[class*="Account"],li,[role="button"],button'
-          )).filter(n => {
-            const s = getComputedStyle(n);
-            const r = n.getBoundingClientRect();
-            return s.display !== 'none' && r.width > 40 && r.height > 20;
-          });
-          if (cards.length){ cards[0].click(); return 'card:' + ((cards[0].innerText || '').slice(0, 40)); }
           return '';
         }""", email or '') or ''
     except Exception:
@@ -564,7 +568,40 @@ def _click_authorize(page, tries=1):
         time.sleep(0.6)
     return False
 
+# texts shown once authorization is done (qoder "Sign in success" page)
+_SUCCESS_HINTS = ["you're all set", 'youre all set', 'all set', 'sign in success',
+                  'sign-in successful', 'return to qoder', 'return to your terminal',
+                  'you can close', 'authorization successful', 'device connected',
+                  'logged in', '登录成功', '授权成功']
+
+def _page_text_has(page, keywords):
+    try:
+        return bool(page.evaluate(r"""(kws) => {
+          const t = ((document.body && document.body.innerText) || '').toLowerCase();
+          return kws.some(k => t.includes(k));
+        }""", [k.lower() for k in keywords]))
+    except Exception:
+        return False
+
+def _visible_buttons(page):
+    """Up to 6 visible button texts (for diagnostics on failure)."""
+    try:
+        return page.evaluate(r"""() => {
+          const nodes = Array.from(document.querySelectorAll('button,[role="button"],a'));
+          return nodes.filter(n => {
+            const s = getComputedStyle(n);
+            const r = n.getBoundingClientRect();
+            return s.display !== 'none' && r.width > 0 && r.height > 0;
+          }).map(n => (n.innerText || n.textContent || '').trim().slice(0, 30))
+            .filter(Boolean).slice(0, 6);
+        }""") or []
+    except Exception:
+        return []
+
 def _approve_qoder(ctx, page, acc, d, prof):
+    """Drive the qoder device-authorize page as a STATE LOOP (not fixed steps):
+    login-redirect? → warm up once | success text? → done | account card? →
+    click | approve button (Continue/Authorize/…)? → click | else wait render."""
     url = d.get('verification_uri_complete') or d.get('verification_uri')
     try:
         ctx.clear_cookies()
@@ -575,49 +612,63 @@ def _approve_qoder(ctx, page, acc, d, prof):
         return 'fail', 'no qoder_session_cookie'
     _plant_cookies(ctx, cookies)
 
-    # open the device authorize URL DIRECTLY (cookies already planted in context)
     try:
         page.goto(url, wait_until='domcontentloaded', timeout=35000)
     except Exception as e:
         vlog(f"goto device url: {str(e)[:60]}")
-    time.sleep(1.2)
-    _dismiss_cookies(page)
 
-    # if redirected to a login page: warm up the session via qoder.com ONCE,
-    # re-plant cookies, retry the device URL. Still login → session expired.
-    if _needs_login(page.url):
-        vlog("device URL asks for login — one-time fallback via qoder.com")
+    warmed = False
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        # login page → warm the session via qoder.com ONCE, then retry
         try:
-            page.goto('https://qoder.com/', wait_until='domcontentloaded', timeout=25000)
+            cur = page.url
         except Exception:
-            pass
-        time.sleep(1.0)
-        _plant_cookies(ctx, cookies)
-        try:
-            page.goto(url, wait_until='domcontentloaded', timeout=35000)
-        except Exception:
-            pass
-        time.sleep(1.2)
+            cur = ''
+        if _needs_login(cur):
+            if warmed:
+                return 'fail', 'SSO expired'
+            warmed = True
+            vlog("device URL asks for login — one-time fallback via qoder.com")
+            try:
+                page.goto('https://qoder.com/', wait_until='domcontentloaded', timeout=25000)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            _plant_cookies(ctx, cookies)
+            try:
+                page.goto(url, wait_until='domcontentloaded', timeout=35000)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            continue
+
+        # already authorized? (also the state right after the last click)
+        if _page_text_has(page, _SUCCESS_HINTS):
+            return 'ok', acc.get('email', '')
+
         _dismiss_cookies(page)
-        if _needs_login(page.url):
-            return 'fail', 'SSO expired'
 
-    # pick the account (if a selectAccounts list is shown)
-    picked = _select_account(page, acc.get('email', ''))
-    if picked:
-        vlog(f"picked account: {picked}")
-        time.sleep(0.7)
+        # account list shown (multi-session)? pick the one matching the email
+        picked = _select_account(page, acc.get('email', ''))
+        if picked:
+            vlog(f"picked account: {picked}")
+            time.sleep(0.7)
+            continue
 
-    # click Authorize / Confirm
-    if not _click_authorize(page, tries=2):
-        return 'fail', 'no Authorize button'
-    time.sleep(1.0)
+        # approve / continue / authorize button
+        if _click_authorize(page):
+            vlog("clicked authorize/continue")
+            time.sleep(1.0)
+            continue
 
-    # sometimes a second confirm click is needed
-    if _click_authorize(page):
-        vlog("second confirm click")
-        time.sleep(0.8)
-    return 'ok', acc.get('email', '')
+        time.sleep(0.8)   # page (React) still rendering → keep waiting
+
+    # one last success check, then give up with diagnostics
+    if _page_text_has(page, _SUCCESS_HINTS):
+        return 'ok', acc.get('email', '')
+    btns = ', '.join(_visible_buttons(page)) or '-'
+    return 'fail', f"no Authorize button (buttons: {btns})"
 
 # ── Provider profiles ─────────────────────────────────────────
 PROFILES = {
