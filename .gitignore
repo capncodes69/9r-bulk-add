@@ -5,9 +5,9 @@ __pycache__/
 *.log
 *.jsonl
 
-# credentials
-sso-pending.txt
-sso-added.txt
+# credentials / account data
+input/
+output/
 sso.txt
 accounts.json
 
